@@ -13,25 +13,6 @@ def upgrade():
     # Existing attempts lack a trustworthy historical token; never backfill from
     # a potentially changed payment method. Recovery refuses those legacy rows.
     op.add_column("payments", sa.Column("provider_token", sa.Text(), nullable=True))
-    op.create_table(
-        "mock_charges",
-        sa.Column(
-            "id", sa.UUID(), primary_key=True, server_default=sa.func.gen_random_uuid()
-        ),
-        sa.Column(
-            "created_at",
-            sa.DateTime(timezone=True),
-            nullable=False,
-            server_default=sa.func.now(),
-        ),
-        sa.Column("token_fingerprint", sa.Text(), nullable=False),
-        sa.Column("amount", sa.Numeric(12, 2), nullable=False),
-        sa.Column("currency", sa.Text(), nullable=False),
-        sa.Column("status", sa.Text(), nullable=False),
-        sa.CheckConstraint(
-            "status IN ('succeeded','failed')", name="mock_charges_status_check"
-        ),
-    )
     op.execute("""
         CREATE FUNCTION guard_cart_items() RETURNS trigger LANGUAGE plpgsql AS $$
         DECLARE old_cart UUID; new_cart UUID; locked_cart RECORD;
@@ -80,5 +61,4 @@ def downgrade():
     op.execute("DROP FUNCTION guard_cart_identity()")
     op.execute("DROP TRIGGER guard_cart_items ON cart_items")
     op.execute("DROP FUNCTION guard_cart_items()")
-    op.drop_table("mock_charges")
     op.drop_column("payments", "provider_token")

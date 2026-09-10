@@ -1,28 +1,23 @@
 # Payment endpoint
 
-A local take-home application using Python, Flask, SQLAlchemy ORM, Alembic and
-PostgreSQL. It starts a payment for an owned cart, records attempts, prevents duplicate
-charges, and checks out the cart only after confirmed success.
+A Flask and PostgreSQL service that starts payments for owned carts, records attempts, prevents duplicate live payments, and checks out carts after confirmed payment.
 
-## Run
+## Demo setup
 
-Requires Python 3.11+, [uv](https://docs.astral.sh/uv/getting-started/installation/),
-and Docker with Compose:
+Requires Python 3.11+, [uv](https://docs.astral.sh/uv/getting-started/installation/), and Docker with Compose.
 
 ```sh
 uv sync --locked
 docker compose up -d --wait
+export DATABASE_URL=postgresql+psycopg://shop:shop@localhost:55432/shop
 uv run alembic upgrade head
-uv run flask --app app seed-db
+export APP_CONFIG=demo
 export DEMO_API_TOKEN=local-alice-secret
 export DEMO_BOB_API_TOKEN=local-bob-secret
 uv run flask --app app run
 ```
 
-`seed-db` inserts sample data once, in a transaction; duplicates fail without
-replacing existing data. Migration upgrades are safe to repeat. `DATABASE_URL`
-overrides `postgresql+psycopg://shop:shop@localhost:55432/shop`. The development
-server listens on `127.0.0.1:5000`. Stop the database with `docker compose stop`.
+Demo mode idempotently loads fixture data and supplies local identity, quote, and mock payment adapters. It uses the same `DATABASE_URL` as production.
 
 Pay Alice's sample cart:
 
@@ -34,13 +29,34 @@ curl -i http://127.0.0.1:5000/carts/c1c1c1c1-c1c1-c1c1-c1c1-c1c1c1c1c1c1/payment
   -d '{"payment_method_id":"11111111-2222-3333-4444-555555555555"}'
 ```
 
-The first successful response is HTTP 201:
+Demo fixtures:
+
+| User | Cart | Payment method | Amount |
+| --- | --- | --- | --- |
+| Alice | `c1c1c1c1-c1c1-c1c1-c1c1-c1c1c1c1c1c1` | `11111111-2222-3333-4444-555555555555` | 70.00 USD |
+| Bob | `c2c2c2c2-c2c2-c2c2-c2c2-c2c2c2c2c2c2` | `22222222-2222-3333-4444-555555555555` | 89.99 USD |
+
+`DEMO_IDENTITIES_JSON` can add token-to-user UUID mappings. `DEMO_QUOTES_JSON` can replace fixture quotes using `{"cart-uuid": ["amount", "CURRENCY"]}`.
+
+The mock provider succeeds normally. `tok_test_decline` declines, while `tok_test_timeout` records one successful mock charge, simulates a lost response, and leaves the payment pending. Mock charge results are stored in PostgreSQL so demo recovery survives application and CLI process restarts.
+
+## API contract
+
+`POST /carts/<cart-uuid>/payments` requires:
+
+- `Authorization: Bearer <token>`
+- `Idempotency-Key`: 1–128 letters, digits, `.`, `_`, `:`, or `-`
+- JSON containing only `payment_method_id`
+
+The amount and currency come from the configured total service. The endpoint never accepts client prices or provider tokens.
+
+A successful new payment returns HTTP 201:
 
 ```json
 {
   "id": "<payment UUID>",
-  "cart_id": "c1c1c1c1-c1c1-c1c1-c1c1-c1c1c1c1c1c1",
-  "payment_method_id": "11111111-2222-3333-4444-555555555555",
+  "cart_id": "<cart UUID>",
+  "payment_method_id": "<payment method UUID>",
   "amount": "70.00",
   "currency": "USD",
   "status": "succeeded",
@@ -48,101 +64,52 @@ The first successful response is HTTP 201:
 }
 ```
 
-Bob's sample cart is `c2c2c2c2-c2c2-c2c2-c2c2-c2c2c2c2c2c2`, his payment method is
-`22222222-2222-3333-4444-555555555555`, and its quote is 89.99 USD. Use Bob's bearer
-token for that cart. Neither user can pay with the other's cart or payment method.
-
-Clients persist an `Idempotency-Key` (1–128 letters, digits, `.`, `_`, `:`, `-`) and
-reuse it after transport errors. Keys are scoped by cart. Replays return the existing
-attempt; changing the selected method with the same key is rejected. A new key is
-allowed only after a definitive decline. Request JSON accepts only `payment_method_id`.
-
 | HTTP | Meaning |
 | --- | --- |
-| 200 / 201 | Existing / newly successful payment |
-| 202 | Pending attempt; ordinary replay does not call the provider |
-| 400 / 415 | Invalid request / JSON content type required |
-| 401 / 404 | Invalid identity / missing or another user's cart or method |
-| 409 | Ineligible cart, conflicting key, or another live attempt |
-| 402 | Definitive decline; cart stays active and can be edited |
-| 502 | Invalid quote, malformed provider response, or provider adapter bug |
-| 503 | Unavailable total service or database |
+| 200 | Existing successful payment |
+| 201 | New successful payment |
+| 202 | Payment outcome remains pending |
+| 400 / 415 | Invalid request or content type |
+| 401 | Invalid identity |
+| 402 | Definitive decline; cart remains active |
+| 404 | Cart or payment method not found for this user |
+| 409 | Ineligible cart, conflicting key, or another live payment |
+| 502 | Invalid dependency response or provider adapter failure |
+| 503 | Total service or database unavailable |
 
-## Recover pending payments
+Idempotency keys are scoped by cart. Retrying the same key returns the existing attempt without charging again. Reusing a key with another payment method is rejected.
 
-The mock persists charge results in `mock_charges`, in an independent transaction.
-This simulates the external provider's durable idempotency store; it has no foreign
-key to the payment attempt. No real card or network call is involved.
+A cart permits only one pending or successful payment. Database constraints and triggers also prevent cart changes while payment is pending or after checkout.
 
-- Normal tokens succeed.
-- `tok_test_decline` produces a definitive decline.
-- `tok_test_timeout` commits a successful mock charge but loses its first response.
-  Its payment remains pending until reconciled.
+## Recovery
 
-Recover one attempt using the payment UUID returned by the endpoint:
+Recover a pending payment with its payment UUID:
 
 ```sh
 uv run flask --app app reconcile-payment <payment-uuid>
+uv run flask --app app reconcile-payment <payment-uuid>  # completed: safe no-op
 ```
 
-The command resubmits the **original** amount, currency, token snapshot and payment
-UUID as the provider idempotency key. It never creates a new attempt. The mock returns
-its stored result, or records a single charge if the process crashed before charging.
-Recovery works across process restarts, concurrently, and after database finalization
-fails. A completed payment is a no-op. Continued provider unavailability leaves the
-payment pending and returns a nonzero command exit status. It is never assumed declined.
+Recovery reuses the stored amount, currency, provider token snapshot, and payment UUID as the provider idempotency key. A completed payment is a no-op; continued provider unavailability returns a nonzero exit status.
 
-For a real provider, the adapter must bound network timeouts and guarantee safe key
-reuse. If a provider's key-retention window expires, it must query/reconcile provider
-state instead of blindly submitting again. Verified, idempotent webhooks and provider
-status lookup are required integration work before live operation. This project uses
-an explicit operator recovery command, not an unattended worker or distributed
-exactly-once guarantee.
+The demo provider durably retains idempotency results in the `mock_charges` table for this workflow. Production providers must provide equivalent durable idempotency across process restarts; the demo provider does not perform real card or network operations and is not a production integration.
 
-## Payment and cart consistency
+## Production configuration
 
-1. Lock the owned cart, check eligibility and key reuse, get a server-side quote, and
-   commit a pending attempt before calling the provider.
-2. Call the provider outside the database transaction. Its key is the payment UUID.
-3. Finalize the payment and cart checkout atomically. Concurrent finalizers reuse the
-   already-confirmed result.
+`APP_CONFIG=production` is the default. Production requires:
 
-A partial unique index permits at most one pending/succeeded attempt per cart.
-Database triggers serialize cart-item writes on the same cart lock and reject inserts,
-updates, deletes and item moves while payment is pending or the cart is checked out.
-Changing ownership or abandoning a cart with a live payment is also rejected. These
-protections apply to ordinary SQL writers, not just this Flask endpoint. Schema owners
-can still bypass them administratively; cart services should handle the resulting
-constraint errors as conflicts.
+- `DATABASE_URL`
+- `IDENTITY_RESOLVER`: callable receiving the Authorization header and returning a user UUID or `None`
+- `TOTAL_SERVICE`: callable receiving a cart UUID and returning a valid `Quote` or matching mapping
+- `PAYMENT_PROVIDER`: callable accepting `token`, `amount`, `currency`, and `idempotency_key`
 
-Amounts use Decimal and NUMERIC(12,2). Quotes and provider response shapes are validated.
-The endpoint never accepts client prices or card tokens. The saved provider token is
-snapshotted on the payment for safe recovery if the saved method later changes. Tokens
-are not returned or logged. Diagnostic logs contain payment IDs and exception classes,
-not provider payloads, exception messages or SQL parameters. Database access must be
-restricted appropriately for these existing provider tokens; no raw card data is stored.
+The deployment composition root must pass the three callables to `create_app`. Missing or non-callable integrations fail startup.
 
-## Integration assumptions
+Quotes must contain a positive, finite, two-decimal `Decimal` amount and a three-letter uppercase currency. Provider results are validated before persistence.
 
-- Existing identity and total calculation belong to the surrounding shop.
-  `IDENTITY_RESOLVER`, `TOTAL_SERVICE` and `PAYMENT_PROVIDER` are injectable, typed
-  contracts in `shop/contracts.py`; the endpoint does not hardcode a user or cart.
-- The demo maps configured bearer tokens to users. No configured identity means
-  authentication fails closed. `DEMO_IDENTITIES_JSON` adds arbitrary token-to-user-UUID
-  mappings; `DEMO_API_TOKEN` and `DEMO_BOB_API_TOKEN` are sample-user conveniences.
-  Replace the resolver with the shop's verified authentication for deployment.
-- Demo quotes are fixtures, **not a calculator**: defaults cover the two seeded carts.
-  `DEMO_QUOTES_JSON` replaces the mapping, using cart UUIDs as keys and
-  `["amount", "CURRENCY"]` as values. Updating demo cart contents requires updating
-  its quote fixture. An injected real total service supplies the current quote while
-  the cart is locked. Missing quotes fail closed rather than inventing a total.
-- Quotes are positive, finite, two-decimal Decimal amounts with three uppercase currency
-  letters. This task assumes currencies using two decimal places. Zero-value checkout
-  is outside scope.
-- Inventory reservation, shipping, orders, refunds and fulfillment are outside this
-  payment-only task. The endpoint does not decrement stock or implement tax calculation.
+Provider adapters must use bounded network timeouts and safely reuse idempotency keys. Production deployments should also implement verified webhooks or provider status lookup.
 
-## Tests and code checks
+## Development checks
 
 ```sh
 uv run pytest -q
@@ -151,48 +118,20 @@ uv run ruff format --check .
 uv run alembic check
 ```
 
-Tests use PostgreSQL and real Alembic migrations in disposable schemas, including
-upgrade/downgrade round trips. Set `TEST_DATABASE_URL` for a separate database. The
-role needs schema creation and pgcrypto installation privileges (Compose provides
-these). The suite covers simultaneous starts, concurrent/restarted recovery, provider
-parameters and malformed responses, multi-user ownership, cart edits racing payment,
-and rollback after a provider succeeds.
+Tests use PostgreSQL and run real Alembic migrations in disposable schemas. Override the database with `TEST_DATABASE_URL`; the role must be able to create schemas and install `pgcrypto`.
 
-## Migrations
-
-- `001_base`: the supplied shop schema.
-- `002_payments`: payment attempts and duplicate-charge constraints.
-- `003_recovery`: token snapshots, the durable mock ledger, and cart guards.
+Apply migrations with:
 
 ```sh
-uv run alembic current
 uv run alembic upgrade head
-uv run alembic revision --autogenerate -m "describe schema change"
 ```
 
-Review generated revisions: Alembic does not automatically detect every check
-constraint or trigger change. Revisions are independent of live ORM models.
-Downgrades remove the corresponding tables/columns and data. The shared pgcrypto
-extension is retained. Use migrations, not `Base.metadata.create_all()`, to provision.
+## Project layout
 
-For an unversioned database from the original SQL scripts, verify its schema first.
-Stamp `001_base` if it has only the supplied base schema, or `002_payments` if it also
-has the matching original payments table, then run `upgrade head`. Stamping records
-history without validating or creating tables; never stamp an empty or mismatched DB.
-Existing sample data must not be reseeded. New Bob demo rows are included on fresh seeds.
-
-Legacy payment attempts have no trustworthy original token snapshot. The migration
-leaves those snapshots null instead of guessing from today's saved card. The recovery
-command refuses such pending rows: reconcile them with the original provider records.
-Already successful/failed attempts retain their results and replay normally.
-
-## Layout
-
-`app.py` is the Flask entry point. `shop/` contains the application factory, routes,
-ORM models, payment orchestration, typed contracts, demo adapters, database setup and
-seed data. `migrations/` owns schema history; `tests/` verifies behavior against PostgreSQL.
-
-Primary references: [Flask testing](https://flask.palletsprojects.com/en/stable/testing/),
-[SQLAlchemy transactions](https://docs.sqlalchemy.org/en/20/core/connections.html),
-[Alembic](https://alembic.sqlalchemy.org/en/latest/), and
-[Stripe idempotency](https://docs.stripe.com/api/idempotent_requests).
+- `app.py`: Flask CLI entry point
+- `shop/app.py`: application factory and global error handling
+- `shop/database.py`: shared engine and session setup
+- `shop/models.py`: shared users, products, carts, and cart items
+- `shop/payments/`: payment routes, service, repository, models, schemas, errors, guards, CLI wiring, and demo fixtures
+- `migrations/`: production database migrations
+- `tests/`: API, persistence, recovery, and concurrency tests

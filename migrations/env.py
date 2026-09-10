@@ -5,7 +5,7 @@ import os
 from alembic import context
 from sqlalchemy import create_engine, pool
 
-from shop.models import Base
+from shop.payments.models import Payment
 
 config = context.config
 url = os.getenv("DATABASE_URL", config.get_main_option("sqlalchemy.url"))
@@ -14,7 +14,7 @@ url = os.getenv("DATABASE_URL", config.get_main_option("sqlalchemy.url"))
 def run_migrations(connection):
     context.configure(
         connection=connection,
-        target_metadata=Base.metadata,
+        target_metadata=Payment.metadata,
         # Keep test schemas independent from a public alembic_version table.
         version_table_schema=connection.exec_driver_sql(
             "SELECT current_schema()"
@@ -28,7 +28,7 @@ def run_migrations(connection):
 
 
 if context.is_offline_mode():
-    context.configure(url=url, target_metadata=Base.metadata, literal_binds=True)
+    context.configure(url=url, target_metadata=Payment.metadata, literal_binds=True)
     with context.begin_transaction():
         context.run_migrations()
 else:
